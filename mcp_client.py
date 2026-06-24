@@ -111,24 +111,25 @@ def get_monitors(dd_api_key: str, dd_app_key: str) -> str:
     )
 
 
-def search_logs(dd_api_key: str, dd_app_key: str, query: str = "status:error") -> str:
-    """MCP Tool: search_datadog_logs"""
+def search_logs(dd_api_key: str, dd_app_key: str, query: str = "status:error", timeframe: str = "past 1 hour") -> str:
+    """MCP Tool: search_datadog_logs dengan timeframe"""
     return call_mcp_tool(
         dd_api_key, dd_app_key,
         tool_name="search_datadog_logs",
         tool_args={
             "query": query,
+            "timeframe": timeframe
         }
     )
 
-
-def get_metrics_summary(dd_api_key: str, dd_app_key: str, metric_query: str) -> str:
-    """MCP Tool: search_datadog_metrics"""
+def get_metrics_summary(dd_api_key: str, dd_app_key: str, metric_query: str, timeframe: str = "past 1 hour") -> str:
+    """MCP Tool: search_datadog_metrics dengan timeframe"""
     return call_mcp_tool(
         dd_api_key, dd_app_key,
         tool_name="search_datadog_metrics",
         tool_args={
             "query": metric_query,
+            "timeframe": timeframe
         }
     )
 

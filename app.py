@@ -48,7 +48,6 @@ def _dd_send_event(api_key, app_key, title, text, alert_type="info"):
         }
     )
 
-
 # ────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI Health Check | Bedrock x Datadog MCP",
@@ -69,7 +68,6 @@ for k, v in {
     if k not in st.session_state:
         st.session_state[k] = v
 
-
 # ── Sidebar ──────────────────────────────────────
 with st.sidebar:
     st.header("🔐 Konfigurasi")
@@ -78,10 +76,19 @@ with st.sidebar:
                                 help="Dari Datadog → Organization Settings → API Keys")
     dd_app_key = st.text_input("Datadog App Key", type="password",
                                 help="Dari Datadog → Organization Settings → Application Keys")
-    log_query  = st.text_input("Log Query", value="status:error OR status:warn")
-    metric_q   = st.text_input("Metric Query (opsional)",
-                                value="avg:system.cpu.user{*}",
-                                help="Query metric Datadog, kosongkan kalau skip")
+    
+    timeframe = st.selectbox(
+        "⏳ Timeframe", 
+        ["past 15 minutes", "past 1 hour", "past 4 hours", "past 24 hours"], 
+        index=1 # Defaultnya ke 'past 1 hour'
+    )
+    
+    # PERUBAHAN UI 1: Sembunyikan Query yang teknis ke dalam expander
+    with st.expander("⚙️ Advanced Settings (Query)"):
+        log_query  = st.text_input("Log Query", value="status:error OR status:warn")
+        metric_q   = st.text_input("Metric Query (opsional)",
+                                    value="avg:system.cpu.user{*}",
+                                    help="Query metric Datadog, kosongkan kalau skip")
 
     st.markdown("---")
 
@@ -110,44 +117,48 @@ with st.sidebar:
         else:
             progress = st.progress(0, text="Memulai...")
 
-            # Step 1: Tarik monitors via MCP
             progress.progress(15, text="MCP → get_monitors...")
             try:
                 monitors_raw = get_monitors(dd_api_key, dd_app_key)
             except Exception as e:
                 monitors_raw = f"Error get_monitors: {e}"
 
-            # Step 2: Tarik logs via MCP
-            progress.progress(35, text="MCP → search_logs...")
+            progress.progress(35, text=f"MCP → search_logs ({timeframe})...")
             try:
-                logs_raw = search_logs(dd_api_key, dd_app_key, log_query)
+                logs_raw = search_logs(dd_api_key, dd_app_key, log_query, timeframe)
             except Exception as e:
                 logs_raw = f"Error search_logs: {e}"
 
-            # Step 3: Tarik services via MCP (opsional)
             progress.progress(50, text="MCP → get_services...")
             try:
                 services_raw = get_apm_services(dd_api_key, dd_app_key)
             except Exception as e:
                 services_raw = f"Error get_services: {e}"
 
-            # Step 4: Tarik metrics via MCP (opsional)
             if metric_q.strip():
-                progress.progress(65, text="MCP → query_metrics...")
+                # progress.progress(70, text=f"MCP → get_usage_metrics ({timeframe})...")
+                # try:
+                #     # Nembak metrik bawaan Datadog untuk billing APM & Logs
+                #     usage_q = "avg:datadog.estimated_usage.hosts{*} OR avg:datadog.estimated_usage.logs.ingested_bytes{*}"
+                #     usage_raw = get_metrics_summary(dd_api_key, dd_app_key, usage_q, timeframe)
+                # except Exception as e:
+                #     usage_raw = f"Error get_usage: {e}"
+                progress.progress(70, text="MCP → get_usage_metrics...")
                 try:
-                    metric_raw = get_metrics_summary(dd_api_key, dd_app_key, metric_q)
-                    services_raw += f"\n\nMETRICS:\n{metric_raw}"
+                    # Ganti avg jadi max, dan paksa timeframe jadi "past 30 days"
+                    usage_q = "max:datadog.estimated_usage.hosts{*}, max:datadog.estimated_usage.apm.hosts{*}, sum:datadog.estimated_usage.synthetics.api_test_runs{*}"
+                    usage_raw = get_metrics_summary(dd_api_key, dd_app_key, usage_q, "past 30 days")
                 except Exception as e:
-                    services_raw += f"\n\nMetrics error: {e}"
+                    usage_raw = f"Error get_usage: {e}"
+            
 
             st.session_state.monitors_raw  = monitors_raw
             st.session_state.logs_raw      = logs_raw
             st.session_state.services_raw  = services_raw
 
-            # Step 5: Analisis dengan Nova Micro
             progress.progress(75, text="Bedrock Nova Micro sedang analisis...")
             try:
-                health = analyze_health_check(monitors_raw, logs_raw, services_raw)
+                health = analyze_health_check(monitors_raw, logs_raw, services_raw, timeframe)
                 st.session_state.health_data = health
                 st.session_state.last_check  = datetime.now().strftime("%d %b %Y, %H:%M:%S")
             except Exception as e:
@@ -155,7 +166,6 @@ with st.sidebar:
                 progress.empty()
                 st.stop()
 
-            # Step 6: Kirim hasil balik ke Datadog
             progress.progress(90, text="Mengirim metric & event ke Datadog...")
             score  = health.get("overall_health_score", 0)
             status = health.get("overall_status", "UNKNOWN")
@@ -169,7 +179,7 @@ with st.sidebar:
                     alert_type=alert_map.get(status, "info")
                 )
             except Exception:
-                pass  # Metric/event gagal tidak halangi dashboard
+                pass  
 
             progress.progress(100, text="Selesai!")
             progress.empty()
@@ -180,9 +190,8 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-
 # ── Main: Dashboard ───────────────────────────────
-st.title("🩺 AI Health Check — Bedrock x Datadog MCP")
+st.title("AI Health Check")
 
 if st.session_state.health_data is None:
     st.info("👈 Klik **Jalankan Health Check** di sidebar untuk memulai.")
@@ -206,28 +215,34 @@ score  = h.get("overall_health_score", 0)
 status = h.get("overall_status", "UNKNOWN")
 emoji  = {"HEALTHY": "🟢", "WARNING": "🟡", "CRITICAL": "🔴"}.get(status, "⚪")
 
-# ── Row 1: Metric cards ───────────────────────────
+# ── Row 1: Metric cards (Full Width) ───────────────────────────
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Overall Health Score", f"{score}/100")
 c2.metric("Status", f"{emoji} {status}")
 c3.metric("Last Check", st.session_state.last_check or "-")
 c4.metric("MCP Tools Connected", len(st.session_state.mcp_tools) or "–")
 
-# Summary & Top Risk
 st.info(f"**Summary:** {h.get('summary', '-')}")
+
+# if h.get("finops_insight") and h.get("finops_insight") != "none":
+#     st.success(f"💰 **FinOps Insight:** {h.get('finops_insight')}")
+
 if h.get("top_risk") and h["top_risk"] != "none":
     st.warning(f"⚠️ **Top Risk:** {h['top_risk']}")
 
 st.markdown("---")
 
-# ── Row 2: Per-service cards ──────────────────────
+# ── Row 1.5: Usage Summary ──────────────────────────────
+usage = h.get("usage_stats", {})
+
+# ── Status Per-service (Full Width) ──────────────────────
 services = h.get("services", [])
 if services:
     st.subheader(f"Status per Service ({len(services)} service)")
-    cols = st.columns(min(len(services), 3))
+    cols = st.columns(min(len(services), 4)) # Bisa nampung sampai 4 card sebaris
     color_map = {"HEALTHY": "#2d6a4f", "WARNING": "#b5770d", "CRITICAL": "#a32d2d"}
     for i, svc in enumerate(services):
-        with cols[i % 3]:
+        with cols[i % 4]:
             c = color_map.get(svc.get("status", ""), "#444")
             e = {"HEALTHY": "🟢", "WARNING": "🟡", "CRITICAL": "🔴"}.get(svc.get("status"), "⚪")
             st.markdown(f"""
@@ -241,7 +256,7 @@ if services:
 
 st.markdown("---")
 
-# ── Row 3: Action items ───────────────────────────
+# ── Action items (Full Width) ───────────────────────────
 action_items = h.get("action_items", [])
 if action_items:
     st.subheader("🛠️ Action Items")
@@ -249,43 +264,54 @@ if action_items:
         st.markdown(f"**{i}.** {item}")
     st.markdown("---")
 
-# ── Row 4: Raw data dari MCP ──────────────────────
-st.subheader("📡 Raw Data dari Datadog MCP")
-tab1, tab2, tab3 = st.tabs(["Monitors", "Logs", "Services & Metrics"])
+# ── Raw Data MCP (Full Width) ───────────────────────────
+with st.expander("📡 Lihat Raw Data dari Datadog MCP (JSON)"):
+    tab1, tab2, tab3, tab4 = st.tabs(["Monitors", "Logs", "Services & Metrics", "Usage"])
 
-with tab1:
-    st.caption("Hasil MCP tool: `get_monitors`")
-    st.code(st.session_state.monitors_raw[:3000] or "Tidak ada data", language="json")
+    with tab1:
+        st.caption("Hasil MCP tool: `get_monitors`")
+        st.code(st.session_state.monitors_raw[:3000] or "Tidak ada data", language="json")
 
-with tab2:
-    st.caption("Hasil MCP tool: `search_logs`")
-    st.code(st.session_state.logs_raw[:3000] or "Tidak ada data", language="json")
+    with tab2:
+        st.caption("Hasil MCP tool: `search_logs`")
+        st.code(st.session_state.logs_raw[:3000] or "Tidak ada data", language="json")
 
-with tab3:
-    st.caption("Hasil MCP tool: `get_services` + `query_metrics`")
-    st.code(st.session_state.services_raw[:2000] or "Tidak ada data", language="json")
+    with tab3:
+        st.caption("Hasil MCP tool: `get_services` + `query_metrics`")
+        st.code(st.session_state.services_raw[:2000] or "Tidak ada data", language="json")
 
-st.markdown("---")
+    # with tab4:
+    #     st.caption("Hasil MCP metrik billing (past 30 days)")
+    #     st.code(st.session_state.get("usage_raw", "Tidak ada data")[:3000], language="json")
 
-# ── Row 5: Chat ───────────────────────────────────
-st.subheader("💬 Tanya AI tentang Health Check Ini")
-st.caption("Tanyakan apapun tentang kondisi sistem berdasarkan data health check terakhir.")
+# ── Chat AI (Sticky di bawah) ───────────────────────────
+# Menggunakan st.container khusus untuk memisahkan chat dari konten utama
+# Agar lebih rapi, kita taruh chat history di dalam expander 
+# dan input text di luar agar selalu terlihat.
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+st.markdown("<br><br><br>", unsafe_allow_html=True) # Memberi ruang agar konten utama tidak tertutup chat
 
-if prompt := st.chat_input("Contoh: Kenapa service payment bisa CRITICAL?"):
+chat_history_container = st.container()
+
+# Menggunakan fitur st.chat_input yang secara default selalu melayang (sticky) di bagian paling bawah layar
+if prompt := st.chat_input("Tanya AI tentang optimasi biaya atau analisis log..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    with st.chat_message("assistant"):
-        with st.spinner("Nova Micro lagi mikir..."):
-            reply = chat_with_context(
-                prompt,
-                h,
-                st.session_state.monitors_raw,
-                st.session_state.logs_raw
-            )
-            st.markdown(reply)
+    
+    # Render user prompt
+    with chat_history_container:
+         with st.expander("💬 Lihat History Chat dengan AI Copilot", expanded=True):
+             with st.chat_message("user"):
+                 st.markdown(prompt)
+             
+             # Render assistant response
+             with st.chat_message("assistant"):
+                 with st.spinner("Nova Micro lagi mikir..."):
+                     reply = chat_with_context(
+                         prompt,
+                         h,
+                         st.session_state.monitors_raw,
+                         st.session_state.logs_raw
+                     )
+                     st.markdown(reply)
+                     
     st.session_state.messages.append({"role": "assistant", "content": reply})

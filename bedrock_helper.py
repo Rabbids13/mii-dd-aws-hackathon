@@ -42,54 +42,43 @@ def _invoke_nova(prompt: str, max_tokens: int = 1200, temperature: float = 0.8) 
 def analyze_health_check(
     monitors_raw: str,
     logs_raw: str,
-    services_raw: str
+    services_raw: str,
+    timeframe: str,
 ) -> dict:
-    """
-    Kirim data MCP Datadog ke Nova Micro.
-    Minta analisis health check terstruktur dalam format JSON.
-
-    monitors_raw, logs_raw, services_raw = string hasil call MCP tool.
-    """
 
     prompt = f"""
-Kamu adalah AI Health Checker untuk sistem production.
-Analisis data Datadog berikut yang diambil via MCP dan berikan health check report.
+Kamu adalah AI SRE Copilot. Analisis data Datadog berikut untuk periode {timeframe}.
+PENTING: Jangan berikan opini atau peringatan terkait limit, license, atau biaya. Cukup ekstrak angka penggunaannya saja.
 
-=== MONITORS (dari MCP tool: get_monitors) ===
+=== MONITORS ===
 {monitors_raw[:3000]}
 
-=== ERROR LOGS (dari MCP tool: search_logs) ===
+=== ERROR LOGS ===
 {logs_raw[:3000]}
 
-=== SERVICES (dari MCP tool: get_services) ===
-{services_raw[:1000]}
+=== SERVICES ===
+{services_raw[:5000]}
 
-Berikan response dalam format JSON STRICT ini.
-PENTING: Jangan tulis apapun selain JSON. Tidak ada markdown, tidak ada backtick.
-
+Berikan response dalam format JSON STRICT ini:
 {{
   "overall_health_score": <angka 0-100>,
   "overall_status": "<HEALTHY|WARNING|CRITICAL>",
-  "summary": "<ringkasan 1-2 kalimat situasi sekarang>",
-  "top_risk": "<risiko terbesar yang terdeteksi dari data>",
+  "summary": "<ringkasan situasi teknis tanpa bahas license>",
+  "usage_stats": {{
+    "infra_hosts": "<angka atau N/A>",
+    "apm_hosts": "<angka atau N/A>",
+    "synthetics": "<angka atau N/A>"
+  }},
+  "top_risk": "<risiko terbesar>",
   "services": [
     {{
-      "name": "<nama service>",
-      "health_score": <0-100>,
-      "status": "<HEALTHY|WARNING|CRITICAL>",
-      "issue": "<issue singkat atau none>",
-      "action": "<langkah mitigasi atau none>"
+      "name": "<nama>", "health_score": <0-100>, "status": "<status>", "issue": "<issue>", "action": "<mitigasi>"
     }}
   ],
-  "action_items": [
-    "<langkah 1>",
-    "<langkah 2>",
-    "<langkah 3>"
-  ]
+  "action_items": ["<langkah 1>", "<langkah 2>"]
 }}
 """
-
-    raw = _invoke_nova(prompt, max_tokens=1200, temperature=0.0)
+    raw = _invoke_nova(prompt, max_tokens=2000, temperature=0.0)
 
     try:
         return json.loads(raw)
