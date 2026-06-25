@@ -2,10 +2,13 @@
 mcp_client.py
 =============
 Koneksi ke Datadog MCP Server menggunakan REST HTTP JSON-RPC dengan session ID.
+Includes Datadog LLM Observability tool spans for each MCP tool call.
 """
 
 import httpx
 import json
+from ddtrace.llmobs import LLMObs
+from ddtrace.llmobs.decorators import tool
 
 DATADOG_MCP_URL = "https://mcp.datadoghq.com/v1/mcp"
 
@@ -64,36 +67,53 @@ def _call_mcp(dd_api_key: str, dd_app_key: str, method: str, params: dict | None
         return response.json()
 
 
+@tool(name="list_tools")
 def list_available_tools(dd_api_key: str, dd_app_key: str) -> list[str]:
     """List semua tools yang tersedia di Datadog MCP Server."""
+    LLMObs.annotate(
+        input_data=json.dumps({"method": "tools/list"}),
+    )
     data = _call_mcp(dd_api_key, dd_app_key, method="tools/list")
     if "error" in data:
         raise RuntimeError(f"MCP error: {json.dumps(data['error'])}")
 
     result = data.get("result") or {}
     tools = result.get("tools") or []
-    return [t.get("name") for t in tools if isinstance(t, dict) and t.get("name")]
+    tool_names = [t.get("name") for t in tools if isinstance(t, dict) and t.get("name")]
+    LLMObs.annotate(
+        output_data=json.dumps(tool_names),
+    )
+    return tool_names
 
 
 def call_mcp_tool(dd_api_key: str, dd_app_key: str, tool_name: str, tool_args: dict) -> str:
-    """Memanggil tool spesifik di Datadog MCP Server."""
-    result = _call_mcp(
-        dd_api_key,
-        dd_app_key,
-        method="tools/call",
-        params={"name": tool_name, "arguments": tool_args},
-    )
+    """Memanggil tool spesifik di Datadog MCP Server, wrapped in an LLMObs tool span."""
+    with LLMObs.tool(name=tool_name) as span:
+        LLMObs.annotate(
+            input_data=json.dumps({"tool": tool_name, "arguments": tool_args}),
+        )
+        result = _call_mcp(
+            dd_api_key,
+            dd_app_key,
+            method="tools/call",
+            params={"name": tool_name, "arguments": tool_args},
+        )
 
-    if "error" in result:
-        return f"Error dari Datadog MCP: {json.dumps(result['error'])}"
+        if "error" in result:
+            error_msg = f"Error dari Datadog MCP: {json.dumps(result['error'])}"
+            LLMObs.annotate(output_data=error_msg)
+            return error_msg
 
-    result_body = result.get("result") or {}
-    content = result_body.get("content")
-    if isinstance(content, list):
-        texts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
-        return "\n".join(texts)
+        result_body = result.get("result") or {}
+        content = result_body.get("content")
+        if isinstance(content, list):
+            texts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+            output = "\n".join(texts)
+            LLMObs.annotate(output_data=output[:2000])
+            return output
 
-    return "Tidak ada respons teks dari MCP server."
+        LLMObs.annotate(output_data="Tidak ada respons teks dari MCP server.")
+        return "Tidak ada respons teks dari MCP server."
 
 
 # ─────────────────────────────────────────────
@@ -121,6 +141,7 @@ def search_logs(dd_api_key: str, dd_app_key: str, query: str = "status:error", t
             "timeframe": timeframe
         }
     )
+
 
 def get_metrics_summary(dd_api_key: str, dd_app_key: str, metric_query: str, timeframe: str = "past 1 hour") -> str:
     """MCP Tool: search_datadog_metrics dengan timeframe"""

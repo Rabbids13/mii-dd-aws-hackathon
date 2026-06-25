@@ -5,9 +5,17 @@ AI Health Check Dashboard
 Datadog MCP --> Amazon Bedrock Nova Micro --> Streamlit Dashboard
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
+import ddtrace.auto
+
 import streamlit as st
 import json
 from datetime import datetime
+
+from ddtrace.llmobs import LLMObs
+from ddtrace.llmobs.decorators import workflow
 
 from mcp_client import (
     list_available_tools,
@@ -20,6 +28,54 @@ from bedrock_helper import analyze_health_check, chat_with_context
 
 # ── Datadog REST API (hanya untuk kirim metric & event balik) ──
 import requests as _requests
+
+
+@workflow(name="run_health_check")
+def _run_health_check(dd_api_key, dd_app_key, log_query, metric_q, timeframe):
+    """
+    Full health check workflow traced as a single workflow span.
+    MCP tool calls + Bedrock LLM call are nested as child spans.
+    """
+    # Step 1: Tarik monitors via MCP
+    try:
+        monitors_raw = get_monitors(dd_api_key, dd_app_key)
+    except Exception as e:
+        monitors_raw = f"Error get_monitors: {e}"
+
+    # Step 2: Tarik logs via MCP
+    try:
+        logs_raw = search_logs(dd_api_key, dd_app_key, log_query, timeframe)
+    except Exception as e:
+        logs_raw = f"Error search_logs: {e}"
+
+    # Step 3: Tarik services via MCP
+    try:
+        services_raw = get_apm_services(dd_api_key, dd_app_key)
+    except Exception as e:
+        services_raw = f"Error get_services: {e}"
+
+    # Step 4: Tarik metrics via MCP (opsional)
+    if metric_q.strip():
+        try:
+            usage_q = "max:datadog.estimated_usage.hosts{*}, max:datadog.estimated_usage.apm.hosts{*}, sum:datadog.estimated_usage.synthetics.api_test_runs{*}"
+            usage_raw = get_metrics_summary(dd_api_key, dd_app_key, usage_q, "past 30 days")
+        except Exception as e:
+            usage_raw = f"Error get_usage: {e}"
+
+    # Step 5: Analisis dengan Nova Micro
+    health = analyze_health_check(monitors_raw, logs_raw, services_raw, timeframe)
+
+    LLMObs.annotate(
+        input_data=json.dumps({
+            "log_query": log_query,
+            "metric_query": metric_q,
+            "timeframe": timeframe,
+        }),
+        output_data=json.dumps(health),
+    )
+
+    return monitors_raw, logs_raw, services_raw, health
+
 
 def _dd_send_metric(api_key, score, status):
     """Kirim health score ke Datadog sebagai custom metric."""
@@ -76,13 +132,13 @@ with st.sidebar:
                                 help="Dari Datadog → Organization Settings → API Keys")
     dd_app_key = st.text_input("Datadog App Key", type="password",
                                 help="Dari Datadog → Organization Settings → Application Keys")
-    
+
     timeframe = st.selectbox(
-        "⏳ Timeframe", 
-        ["past 15 minutes", "past 1 hour", "past 4 hours", "past 24 hours"], 
-        index=1 # Defaultnya ke 'past 1 hour'
+        "⏳ Timeframe",
+        ["past 15 minutes", "past 1 hour", "past 4 hours", "past 24 hours"],
+        index=1
     )
-    
+
     # PERUBAHAN UI 1: Sembunyikan Query yang teknis ke dalam expander
     with st.expander("⚙️ Advanced Settings (Query)"):
         log_query  = st.text_input("Log Query", value="status:error OR status:warn")
@@ -116,56 +172,24 @@ with st.sidebar:
             st.error("Isi API Key & App Key dulu!")
         else:
             progress = st.progress(0, text="Memulai...")
+            progress.progress(15, text="Running health check workflow...")
 
-            progress.progress(15, text="MCP → get_monitors...")
             try:
-                monitors_raw = get_monitors(dd_api_key, dd_app_key)
+                monitors_raw, logs_raw, services_raw, health = _run_health_check(
+                    dd_api_key, dd_app_key, log_query, metric_q, timeframe
+                )
             except Exception as e:
-                monitors_raw = f"Error get_monitors: {e}"
-
-            progress.progress(35, text=f"MCP → search_logs ({timeframe})...")
-            try:
-                logs_raw = search_logs(dd_api_key, dd_app_key, log_query, timeframe)
-            except Exception as e:
-                logs_raw = f"Error search_logs: {e}"
-
-            progress.progress(50, text="MCP → get_services...")
-            try:
-                services_raw = get_apm_services(dd_api_key, dd_app_key)
-            except Exception as e:
-                services_raw = f"Error get_services: {e}"
-
-            if metric_q.strip():
-                # progress.progress(70, text=f"MCP → get_usage_metrics ({timeframe})...")
-                # try:
-                #     # Nembak metrik bawaan Datadog untuk billing APM & Logs
-                #     usage_q = "avg:datadog.estimated_usage.hosts{*} OR avg:datadog.estimated_usage.logs.ingested_bytes{*}"
-                #     usage_raw = get_metrics_summary(dd_api_key, dd_app_key, usage_q, timeframe)
-                # except Exception as e:
-                #     usage_raw = f"Error get_usage: {e}"
-                progress.progress(70, text="MCP → get_usage_metrics...")
-                try:
-                    # Ganti avg jadi max, dan paksa timeframe jadi "past 30 days"
-                    usage_q = "max:datadog.estimated_usage.hosts{*}, max:datadog.estimated_usage.apm.hosts{*}, sum:datadog.estimated_usage.synthetics.api_test_runs{*}"
-                    usage_raw = get_metrics_summary(dd_api_key, dd_app_key, usage_q, "past 30 days")
-                except Exception as e:
-                    usage_raw = f"Error get_usage: {e}"
-            
+                st.error(f"Health check error: {e}")
+                progress.empty()
+                st.stop()
 
             st.session_state.monitors_raw  = monitors_raw
             st.session_state.logs_raw      = logs_raw
             st.session_state.services_raw  = services_raw
+            st.session_state.health_data   = health
+            st.session_state.last_check    = datetime.now().strftime("%d %b %Y, %H:%M:%S")
 
-            progress.progress(75, text="Bedrock Nova Micro sedang analisis...")
-            try:
-                health = analyze_health_check(monitors_raw, logs_raw, services_raw, timeframe)
-                st.session_state.health_data = health
-                st.session_state.last_check  = datetime.now().strftime("%d %b %Y, %H:%M:%S")
-            except Exception as e:
-                st.error(f"Bedrock error: {e}")
-                progress.empty()
-                st.stop()
-
+            # Step 6: Kirim hasil balik ke Datadog
             progress.progress(90, text="Mengirim metric & event ke Datadog...")
             score  = health.get("overall_health_score", 0)
             status = health.get("overall_status", "UNKNOWN")
@@ -179,7 +203,7 @@ with st.sidebar:
                     alert_type=alert_map.get(status, "info")
                 )
             except Exception:
-                pass  
+                pass
 
             progress.progress(100, text="Selesai!")
             progress.empty()
@@ -224,22 +248,16 @@ c4.metric("MCP Tools Connected", len(st.session_state.mcp_tools) or "–")
 
 st.info(f"**Summary:** {h.get('summary', '-')}")
 
-# if h.get("finops_insight") and h.get("finops_insight") != "none":
-#     st.success(f"💰 **FinOps Insight:** {h.get('finops_insight')}")
-
 if h.get("top_risk") and h["top_risk"] != "none":
     st.warning(f"⚠️ **Top Risk:** {h['top_risk']}")
 
 st.markdown("---")
 
-# ── Row 1.5: Usage Summary ──────────────────────────────
-usage = h.get("usage_stats", {})
-
 # ── Status Per-service (Full Width) ──────────────────────
 services = h.get("services", [])
 if services:
     st.subheader(f"Status per Service ({len(services)} service)")
-    cols = st.columns(min(len(services), 4)) # Bisa nampung sampai 4 card sebaris
+    cols = st.columns(min(len(services), 4))
     color_map = {"HEALTHY": "#2d6a4f", "WARNING": "#b5770d", "CRITICAL": "#a32d2d"}
     for i, svc in enumerate(services):
         with cols[i % 4]:
@@ -266,7 +284,7 @@ if action_items:
 
 # ── Raw Data MCP (Full Width) ───────────────────────────
 with st.expander("📡 Lihat Raw Data dari Datadog MCP (JSON)"):
-    tab1, tab2, tab3, tab4 = st.tabs(["Monitors", "Logs", "Services & Metrics", "Usage"])
+    tab1, tab2, tab3 = st.tabs(["Monitors", "Logs", "Services & Metrics"])
 
     with tab1:
         st.caption("Hasil MCP tool: `get_monitors`")
@@ -280,30 +298,19 @@ with st.expander("📡 Lihat Raw Data dari Datadog MCP (JSON)"):
         st.caption("Hasil MCP tool: `get_services` + `query_metrics`")
         st.code(st.session_state.services_raw[:2000] or "Tidak ada data", language="json")
 
-    # with tab4:
-    #     st.caption("Hasil MCP metrik billing (past 30 days)")
-    #     st.code(st.session_state.get("usage_raw", "Tidak ada data")[:3000], language="json")
-
 # ── Chat AI (Sticky di bawah) ───────────────────────────
-# Menggunakan st.container khusus untuk memisahkan chat dari konten utama
-# Agar lebih rapi, kita taruh chat history di dalam expander 
-# dan input text di luar agar selalu terlihat.
-
-st.markdown("<br><br><br>", unsafe_allow_html=True) # Memberi ruang agar konten utama tidak tertutup chat
+st.markdown("<br><br><br>", unsafe_allow_html=True)
 
 chat_history_container = st.container()
 
-# Menggunakan fitur st.chat_input yang secara default selalu melayang (sticky) di bagian paling bawah layar
 if prompt := st.chat_input("Tanya AI tentang optimasi biaya atau analisis log..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    
-    # Render user prompt
+
     with chat_history_container:
          with st.expander("💬 Lihat History Chat dengan AI Copilot", expanded=True):
              with st.chat_message("user"):
                  st.markdown(prompt)
-             
-             # Render assistant response
+
              with st.chat_message("assistant"):
                  with st.spinner("Nova Micro lagi mikir..."):
                      reply = chat_with_context(
@@ -313,5 +320,5 @@ if prompt := st.chat_input("Tanya AI tentang optimasi biaya atau analisis log...
                          st.session_state.logs_raw
                      )
                      st.markdown(reply)
-                     
+
     st.session_state.messages.append({"role": "assistant", "content": reply})

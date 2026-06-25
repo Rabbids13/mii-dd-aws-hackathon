@@ -2,13 +2,15 @@
 bedrock_helper.py
 =================
 Semua interaksi dengan Amazon Bedrock Nova Micro.
-Otomatis ter-trace ke Datadog LLM Observability lewat ddtrace.
+Traced ke Datadog LLM Observability lewat ddtrace decorators + auto-instrumentation.
 """
 
 import boto3
 import json
 import os
 import re
+from ddtrace.llmobs import LLMObs
+from ddtrace.llmobs.decorators import llm, workflow
 
 
 def get_bedrock_client():
@@ -18,12 +20,18 @@ def get_bedrock_client():
     )
 
 
+@llm(model_name="amazon.nova-micro-v1:0", model_provider="amazon_bedrock", name="invoke_nova_micro")
 def _invoke_nova(prompt: str, max_tokens: int = 4000, temperature: float = 0.8) -> str:
     """
     Panggil Amazon Nova Micro via Bedrock.
     Nova Micro pakai format Converse API (bukan invoke_model langsung).
     """
     client = get_bedrock_client()
+
+    LLMObs.annotate(
+        input_data=[{"role": "user", "content": prompt}],
+        metadata={"max_tokens": max_tokens, "temperature": temperature},
+    )
 
     response = client.converse(
         modelId="amazon.nova-micro-v1:0",
@@ -36,9 +44,29 @@ def _invoke_nova(prompt: str, max_tokens: int = 4000, temperature: float = 0.8) 
         }
     )
 
-    return response["output"]["message"]["content"][0]["text"]
+    output_text = response["output"]["message"]["content"][0]["text"]
+
+    # Extract token usage if available
+    usage = response.get("usage", {})
+    metrics = {}
+    if usage.get("inputTokens"):
+        metrics["input_tokens"] = usage["inputTokens"]
+    if usage.get("outputTokens"):
+        metrics["output_tokens"] = usage["outputTokens"]
+    if usage.get("totalTokens"):
+        metrics["total_tokens"] = usage["totalTokens"]
+    elif metrics.get("input_tokens") and metrics.get("output_tokens"):
+        metrics["total_tokens"] = metrics["input_tokens"] + metrics["output_tokens"]
+
+    LLMObs.annotate(
+        output_data=[{"role": "assistant", "content": output_text}],
+        metrics=metrics if metrics else None,
+    )
+
+    return output_text
 
 
+@workflow(name="analyze_health_check")
 def analyze_health_check(
     monitors_raw: str,
     logs_raw: str,
@@ -69,28 +97,25 @@ Berikan response dalam format JSON STRICT ini (TANPA memasukkan list service):
   "action_items": ["<langkah 1>", "<langkah 2>"]
 }}
 """
-    # Pastikan temperature 0.0 untuk JSON
     raw_main = _invoke_nova(prompt_main, max_tokens=1500, temperature=0.0)
-    
+
     try:
         match = re.search(r"\{.*\}", raw_main, re.DOTALL)
         main_data = json.loads(match.group()) if match else json.loads(raw_main)
     except Exception as e:
         main_data = {
-            "overall_health_score": 0, "overall_status": "UNKNOWN", 
-            "summary": f"Gagal parse main data: {e}", "top_risk": "none", 
+            "overall_health_score": 0, "overall_status": "UNKNOWN",
+            "summary": f"Gagal parse main data: {e}", "top_risk": "none",
             "action_items": ["Cek log Bedrock"]
         }
 
     # --- TAHAP 2: BATCHING UNTUK SERVICES ---
-# --- TAHAP 2: BATCHING UNTUK SERVICES ---
     all_services = []
-    chunk_size = 3500 
-    
+    chunk_size = 3500
+
     chunks = [services_raw[i:i+chunk_size] for i in range(0, len(services_raw), chunk_size)]
-    
-    for chunk in chunks[:4]: 
-        # 👇 TIMPA PROMPT_SVC JADI SEPERTI INI 👇
+
+    for chunk in chunks[:4]:
         prompt_svc = f"""
 Ekstrak daftar service dari potongan data APM Datadog ini, dan nilai kesehatannya (health_score) dengan mencocokkannya melawan data Error Logs dan Monitors.
 
@@ -118,7 +143,7 @@ Berikan HANYA format JSON Array (List). Jangan ada markdown atau teks tambahan.
 ]
 """
         raw_svc = _invoke_nova(prompt_svc, max_tokens=2000, temperature=0.0)
-        
+
         try:
             match_svc = re.search(r"\[.*\]", raw_svc, re.DOTALL)
             if match_svc:
@@ -127,12 +152,14 @@ Berikan HANYA format JSON Array (List). Jangan ada markdown atau teks tambahan.
                     all_services.extend(svc_list)
         except Exception:
             pass
-            
+
     # --- TAHAP 3: GABUNGKAN HASIL ---
     main_data["services"] = all_services
-    
+
     return main_data
 
+
+@workflow(name="chat_with_context")
 def chat_with_context(user_prompt: str, health_data: dict, monitors_raw: str, logs_raw: str) -> str:
     """
     Mode chat freestyle.
