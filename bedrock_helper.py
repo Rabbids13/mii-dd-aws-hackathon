@@ -18,7 +18,7 @@ def get_bedrock_client():
     )
 
 
-def _invoke_nova(prompt: str, max_tokens: int = 1200, temperature: float = 0.8) -> str:
+def _invoke_nova(prompt: str, max_tokens: int = 4000, temperature: float = 0.8) -> str:
     """
     Panggil Amazon Nova Micro via Bedrock.
     Nova Micro pakai format Converse API (bukan invoke_model langsung).
@@ -43,12 +43,16 @@ def analyze_health_check(
     monitors_raw: str,
     logs_raw: str,
     services_raw: str,
-    timeframe: str,
+    timeframe: str
 ) -> dict:
+    """
+    Kirim data MCP Datadog ke Nova Micro dengan teknik BATCHING (Operasi Berulang).
+    Memisahkan pencarian Health Score utama dengan ekstraksi daftar Service.
+    """
 
-    prompt = f"""
+    # --- TAHAP 1: PROMPT UTAMA (Health Score & Action Items) ---
+    prompt_main = f"""
 Kamu adalah AI SRE Copilot. Analisis data Datadog berikut untuk periode {timeframe}.
-PENTING: Jangan berikan opini atau peringatan terkait limit, license, atau biaya. Cukup ekstrak angka penggunaannya saja.
 
 === MONITORS ===
 {monitors_raw[:3000]}
@@ -56,50 +60,78 @@ PENTING: Jangan berikan opini atau peringatan terkait limit, license, atau biaya
 === ERROR LOGS ===
 {logs_raw[:3000]}
 
-=== SERVICES ===
-{services_raw[:5000]}
-
-Berikan response dalam format JSON STRICT ini:
+Berikan response dalam format JSON STRICT ini (TANPA memasukkan list service):
 {{
   "overall_health_score": <angka 0-100>,
   "overall_status": "<HEALTHY|WARNING|CRITICAL>",
-  "summary": "<ringkasan situasi teknis tanpa bahas license>",
-  "usage_stats": {{
-    "infra_hosts": "<angka atau N/A>",
-    "apm_hosts": "<angka atau N/A>",
-    "synthetics": "<angka atau N/A>"
-  }},
+  "summary": "<ringkasan situasi teknis>",
   "top_risk": "<risiko terbesar>",
-  "services": [
-    {{
-      "name": "<nama>", "health_score": <0-100>, "status": "<status>", "issue": "<issue>", "action": "<mitigasi>"
-    }}
-  ],
   "action_items": ["<langkah 1>", "<langkah 2>"]
 }}
 """
-    raw = _invoke_nova(prompt, max_tokens=2000, temperature=0.0)
-
+    # Pastikan temperature 0.0 untuk JSON
+    raw_main = _invoke_nova(prompt_main, max_tokens=1500, temperature=0.0)
+    
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Nova Micro kadang masih nambah teks di luar JSON, strip dulu
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except Exception:
-                pass
-        # Fallback kalau parse gagal total
-        return {
-            "overall_health_score": 0,
-            "overall_status": "UNKNOWN",
-            "summary": f"Gagal parse response AI: {raw[:300]}",
-            "top_risk": "Parse error",
-            "services": [],
-            "action_items": ["Cek koneksi Bedrock", "Coba jalankan ulang health check"]
+        match = re.search(r"\{.*\}", raw_main, re.DOTALL)
+        main_data = json.loads(match.group()) if match else json.loads(raw_main)
+    except Exception as e:
+        main_data = {
+            "overall_health_score": 0, "overall_status": "UNKNOWN", 
+            "summary": f"Gagal parse main data: {e}", "top_risk": "none", 
+            "action_items": ["Cek log Bedrock"]
         }
 
+    # --- TAHAP 2: BATCHING UNTUK SERVICES ---
+# --- TAHAP 2: BATCHING UNTUK SERVICES ---
+    all_services = []
+    chunk_size = 3500 
+    
+    chunks = [services_raw[i:i+chunk_size] for i in range(0, len(services_raw), chunk_size)]
+    
+    for chunk in chunks[:4]: 
+        # 👇 TIMPA PROMPT_SVC JADI SEPERTI INI 👇
+        prompt_svc = f"""
+Ekstrak daftar service dari potongan data APM Datadog ini, dan nilai kesehatannya (health_score) dengan mencocokkannya melawan data Error Logs dan Monitors.
+
+=== ACTIVE MONITORS & ERROR LOGS (Gunakan ini sebagai acuan error) ===
+{monitors_raw[:1500]}
+{logs_raw[:1500]}
+
+=== DATA APM SERVICES ===
+{chunk}
+
+ATURAN PENILAIAN WAJIB:
+1. Cross-check nama service dari APM dengan data Monitors/Logs di atas.
+2. Jika nama service tercantum di dalam Logs/Monitors yang sedang ERROR atau FAIL, turunkan skornya (contoh: 40-80), set status jadi "WARNING" atau "CRITICAL", dan tulis issue-nya.
+3. Jika service aman (tidak ada di log error), berikan skor 95-100 dan status "HEALTHY".
+
+Berikan HANYA format JSON Array (List). Jangan ada markdown atau teks tambahan.
+[
+  {{
+    "name": "<nama_service>",
+    "health_score": <0-100>,
+    "status": "<HEALTHY|WARNING|CRITICAL>",
+    "issue": "<issue dari monitor/log atau none>",
+    "action": "<mitigasi atau none>"
+  }}
+]
+"""
+        raw_svc = _invoke_nova(prompt_svc, max_tokens=2000, temperature=0.0)
+        
+        try:
+            match_svc = re.search(r"\[.*\]", raw_svc, re.DOTALL)
+            if match_svc:
+                svc_list = json.loads(match_svc.group())
+                if isinstance(svc_list, list):
+                    all_services.extend(svc_list)
+        except Exception:
+            pass
+            
+    # --- TAHAP 3: GABUNGKAN HASIL ---
+    main_data["services"] = all_services
+    
+    return main_data
 
 def chat_with_context(user_prompt: str, health_data: dict, monitors_raw: str, logs_raw: str) -> str:
     """
@@ -123,4 +155,4 @@ Format jawaban dengan Markdown. Jangan mengarang — kalau data tidak ada, bilan
 {user_prompt}
 """
 
-    return _invoke_nova(prompt, max_tokens=800, temperature=0.1)
+    return _invoke_nova(prompt, max_tokens=4000, temperature=0.8)
