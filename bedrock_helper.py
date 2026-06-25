@@ -16,7 +16,7 @@ from ddtrace.llmobs.decorators import llm, workflow
 def get_bedrock_client():
     return boto3.client(
         service_name="bedrock-runtime",
-        region_name="us-east-1"
+        region_name=os.environ.get("AWS_REGION", "us-east-1")
     )
 
 
