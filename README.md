@@ -1,139 +1,184 @@
-# AI Health Check — Bedrock x Datadog MCP
+# AI Health Check — Bedrock × Datadog MCP
 
 ## Arsitektur
 
 ```
-Streamlit UI
+Streamlit UI (app.py)
     │
     ├── mcp_client.py  ──→  Datadog MCP Server (remote, official)
-    │                           tools: get_monitors, search_logs,
-    │                                  get_services, query_metrics
+    │                         tools: get_monitors, search_logs,
+    │                                get_services, query_metrics
+    │                         [Each call = @tool span in DD LLM Obs]
     │
     ├── bedrock_helper.py ──→  Amazon Bedrock (Nova Micro)
-    │                           analisis data MCP → health score JSON
+    │                           Region: ap-southeast-3 (Jakarta) 🌏
+    │                           + Guardrails (content filtering)
+    │                           + Knowledge Base (RAG grounding)
+    │                           + Multi-Step ReAct Agent
+    │                           [Each call = @llm/@workflow/@task span]
     │
-    └── app.py  ──→  Dashboard Streamlit
-                     + kirim metric balik ke Datadog
-                       (hackathon.ai.health_score)
+    └── app.py  ──→  Dashboard + Ops Setup
+                     + Custom metrics → Datadog
+                     + Monitor + Alert + SLO creation
+                     + Error handling with DD events
 ```
 
 ---
 
-## Step 1 — Install dependencies
+## ✅ Hackathon Checklist Coverage
+
+| # | Item | Implementation |
+|---|------|----------------|
+| 1 | 🟢 First Trace | `@llm` decorator on `_invoke_nova` → LLM span in DD |
+| 2 | 📊 Dashboard Live | Custom metric `hackathon.ai.health_score` + event stream + 3+ widgets |
+| 3 | 🔗 Tool Call Visible | `@tool` decorator on MCP calls → tool spans in DD |
+| 4 | 💸 Cost Tracked | `input_tokens`, `output_tokens`, `estimated_cost_usd` in metrics |
+| 5 | 🧱 Error Handled | `_handle_error` task + error event to DD + error accumulation monitor |
+| 6 | 🚀 End-to-End Demo | workflow → tool → task → LLM spans (see Design doc) |
+| 7 | 🎯 Ops Ready | Monitor (runbook) + Alert (escalation) + SLO (99.5% / 7d) |
+| B1 | Bedrock Online | `python bedrock_helper.py` shows response in terminal |
+| B2 | AWS Knowledge MCP | `.kiro/settings/mcp.json` + design doc in steering |
+| B3 | Built with Kiro | `.kiro/specs/` + `.kiro/steering/` present |
+| B4 | Multi-Step Agent | ReAct pattern with 2+ reason→act steps |
+| B5 | Knowledge Grounded | `retrieve_from_knowledge_base()` tool call |
+| B6 | Guardrails On | `apply_guardrails()` blocks harmful prompts |
+| B7 | Jakarta In-Region | `AWS_REGION=ap-southeast-3` + model in Jakarta |
+
+---
+
+## Quick Start
+
+### Step 1 — Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
-## Step 2 — Setup AWS credentials
+### Step 2 — Configure .env
 
 ```bash
-aws configure
-# AWS Access Key ID: <isi dari IAM>
-# AWS Secret Access Key: <isi dari IAM>
-# Default region: us-east-1
-# Output format: json
+cp .env.example .env
+# Fill in your keys:
+# - DD_API_KEY, DD_APP_KEY
+# - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# - AWS_REGION=ap-southeast-3
+# - BEDROCK_GUARDRAIL_ID (optional)
+# - BEDROCK_KNOWLEDGE_BASE_ID (optional)
 ```
 
-Pastikan IAM user kamu punya policy `AmazonBedrockFullAccess` dan Nova Micro sudah di-enable di Bedrock console.
-
----
-
-## Step 3 — Enable Datadog MCP Server
-
-Datadog MCP Server adalah **remote server** yang disediakan Datadog (bukan yang kamu jalankan sendiri).
-
-1. Buka https://docs.datadoghq.com/bits_ai/mcp_server/
-2. Login ke Datadog account kamu
-3. Pastikan akun kamu punya akses ke Bits AI / MCP Server (tersedia di semua plan)
-4. Siapkan:
-   - **API Key**: Datadog → Organization Settings → API Keys → New Key
-   - **App Key**: Datadog → Organization Settings → Application Keys → New Key
-   - App Key harus punya scope: `monitors_read`, `logs_read`, `metrics_read`
-
----
-
-## Step 4 — Jalankan app
+### Step 3 — Verify Bedrock Online (Terminal Demo)
 
 ```bash
-streamlit run app.py
+python bedrock_helper.py
 ```
 
-Buka browser ke http://localhost:8501
+This runs:
+1. ✅ Bedrock Online check (shows model response)
+2. 🧠 Multi-Step Agent demo (shows 2+ reason→act steps)
+3. 🛡️ Guardrails demo (shows blocked prompt)
 
----
-
-## Step 5 — Di dalam app
-
-1. Isi **Datadog API Key** dan **App Key** di sidebar
-2. Klik **Tes Koneksi MCP** — kalau berhasil akan tampil list tools yang tersedia
-3. Klik **Jalankan Health Check** — app akan:
-   - Panggil `get_monitors` via MCP
-   - Panggil `search_logs` via MCP
-   - Panggil `get_services` via MCP
-   - Kirim semua data ke Bedrock Nova Micro untuk dianalisis
-   - Tampilkan hasilnya di dashboard
-   - Kirim metric `hackathon.ai.health_score` balik ke Datadog
-
----
-
-## Step 6 — Buat Custom Dashboard di Datadog
-
-Setelah health check jalan minimal sekali, metric `hackathon.ai.health_score` sudah masuk.
-
-1. Datadog → **Dashboards** → **New Dashboard**
-2. Tambahkan widget:
-
-| Widget Type | Query | Keterangan |
-|---|---|---|
-| Query Value | `avg:hackathon.ai.health_score{*}` | Overall score sekarang |
-| Timeseries | `avg:hackathon.ai.health_score{*} by {service}` | Trend per service |
-| Top List | `avg:hackathon.ai.health_score{*} by {service}` sort ASC | Service paling sakit |
-| Event Stream | filter `source:bedrock_health_checker` | Event dari AI health check |
-
----
-
-## Step 7 — LLM Observability (opsional tapi penting untuk hackathon)
-
-Supaya semua call ke Nova Micro ke-track di Datadog LLM Observability:
+### Step 4 — Run the App
 
 ```bash
-# Set env vars sebelum jalankan app
-export DD_API_KEY="your_datadog_api_key"
-export DD_LLMOBS_ENABLED=1
-export DD_LLMOBS_ML_APP="hackathon-health-checker"
-export DD_LLMOBS_AGENTLESS_ENABLED=1
-
-# Jalankan dengan ddtrace
 ddtrace-run streamlit run app.py
 ```
 
-Setelah ini, buka Datadog → **LLM Observability** → kamu bisa lihat:
-- Setiap prompt yang dikirim ke Nova Micro
-- Token usage
-- Latency per call
-- Response dari model
+Or with explicit env vars:
+```bash
+export DD_LLMOBS_ENABLED=1
+export DD_LLMOBS_ML_APP=hackathon-health-checker
+export DD_LLMOBS_AGENTLESS_ENABLED=1
+ddtrace-run streamlit run app.py
+```
+
+### Step 5 — In the App
+
+1. Enter **Datadog API Key** and **App Key** in sidebar
+2. Click **🔌 Tes Koneksi MCP** to verify MCP connection
+3. Click **🩺 Jalankan Health Check** to run full workflow
+4. Click **🎯 Setup Monitor + SLO** to create ops infrastructure
+5. Click **🧠 Run Multi-Step Agent** to see ReAct pattern
+6. Use **Chat** to ask questions (guardrails applied)
+
+---
+
+## Observability — What You See in Datadog
+
+### LLM Observability Explorer
+Complete traces with nested spans:
+```
+workflow: run_health_check
+├── tool: search_datadog_monitors
+├── tool: search_datadog_logs
+├── tool: search_datadog_services
+├── workflow: analyze_health_check
+│   ├── llm: invoke_nova_micro (main)
+│   └── llm: invoke_nova_micro (services)
+└── [error handling if needed]
+```
+
+### Custom Dashboard Widgets
+1. **Query Value**: `avg:hackathon.ai.health_score{*}` — Current score
+2. **Timeseries**: `avg:hackathon.ai.health_score{*}` — Score over time
+3. **Event Stream**: `source:bedrock_health_checker` — Events from app
+4. **Monitor Status**: Health score + error accumulation monitors
+
+### Monitors & Alerts
+- **Health Score Alert**: Triggers when score < 50 (critical) or < 70 (warning)
+- **Error Accumulation**: Triggers on 3+ errors in 15 minutes
+- **Runbook**: Embedded in monitor message with escalation policy
+
+### SLO
+- Target: 99.5% availability over 7 days
+- Warning: 99.9%
+- Based on health score monitor
+
+---
+
+## File Structure
+
+```
+health_check_mcp/
+├── app.py                  # Main Streamlit app + workflow
+├── bedrock_helper.py       # Bedrock: LLM, Agent, Guardrails, KB
+├── mcp_client.py           # Datadog MCP Server client
+├── debug_mcp.py            # MCP debug utility
+├── requirements.txt        # Python dependencies
+├── .env                    # Environment variables (not in git)
+├── .env.example            # Template for .env
+├── .gitignore
+├── README.md
+└── .kiro/
+    ├── settings/
+    │   └── mcp.json        # AWS Knowledge MCP config
+    ├── steering/
+    │   ├── project-standards.md    # Coding standards
+    │   └── aws-knowledge-mcp.md   # Design decisions from MCP
+    └── specs/
+        └── health-check-agent/
+            ├── requirements.md     # Functional requirements
+            ├── design.md           # Architecture & trace design
+            └── tasks.md            # Implementation tasks
+```
 
 ---
 
 ## Troubleshooting
 
-**Error: `mcp.client.streamable_http` not found**
-```bash
-pip install --upgrade mcp
-```
+**Error: Bedrock access denied in ap-southeast-3**
+- Ensure Nova Micro is enabled in Jakarta region via Bedrock console
+- Check IAM policy includes `AmazonBedrockFullAccess`
 
 **Error: MCP connection timeout**
-- Cek API Key dan App Key sudah benar
-- Pastikan App Key punya scope yang cukup
-- Coba dari browser: buka https://mcp.datadoghq.com/mcp/v1
+- Verify API Key and App Key are correct
+- Ensure App Key has scopes: `monitors_read`, `logs_read`, `metrics_read`
 
-**Error: Bedrock access denied**
-- Pastikan `aws configure` sudah diisi
-- Cek Nova Micro sudah di-enable di region us-east-1
-- Cek IAM policy ada `AmazonBedrockFullAccess`
+**Guardrails not working**
+- Set `BEDROCK_GUARDRAIL_ID` in .env
+- Create a guardrail in Bedrock console (Jakarta region)
+- Use DRAFT version for testing
 
-**Nova Micro tidak tersedia**
-- Ganti `modelId` di `bedrock_helper.py` ke `amazon.nova-lite-v1:0`# mii-dd-aws-hackathon
+**Knowledge Base not responding**
+- Set `BEDROCK_KNOWLEDGE_BASE_ID` in .env
+- Create a Knowledge Base in Bedrock console with data source
+- Ensure the KB is synced and active

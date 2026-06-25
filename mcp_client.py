@@ -3,6 +3,7 @@ mcp_client.py
 =============
 Koneksi ke Datadog MCP Server menggunakan REST HTTP JSON-RPC dengan session ID.
 Includes Datadog LLM Observability tool spans for each MCP tool call.
+Each MCP tool call is captured as a span visible in Datadog LLM Observability.
 """
 
 import httpx
